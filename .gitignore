@@ -1,0 +1,11 @@
+# 공통
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+# 웹 서비스 (web/.gitignore 에도 있음)
+web/node_modules/
+web/data/
+web/.env
+web/.env.local
+web/.vercel/

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AX Proof 기획서</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%230E6B4B'/%3E%3Ctext x='16' y='21' font-size='13' font-family='Arial' font-weight='900' fill='white' text-anchor='middle'%3EAX%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <style>
+    :root { --bg: #F4F2ED; --ink: #1B2420; --muted: #5E6B64; --line: #E4E0D7; --brand: #0E6B4B; --brand-ink: #0A4F37; --soft: #E2F0E9; --side: #163D30; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: 'Pretendard Variable', Pretendard, 'Malgun Gothic', sans-serif; background: var(--bg); color: var(--ink); line-height: 1.75; word-break: keep-all; }
+    header { background: var(--side); color: #fff; }
+    header .in { max-width: 980px; margin: 0 auto; padding: 18px 20px; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    header a { color: #fff; text-decoration: none; font-weight: 800; }
+    nav.tabs { max-width: 980px; margin: 0 auto; padding: 16px 20px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+    nav.tabs button { border: 1px solid var(--line); background: #fff; border-radius: 10px; padding: 8px 14px; cursor: pointer; font: inherit; font-size: 14px; color: var(--muted); }
+    nav.tabs button[aria-pressed=true] { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 700; }
+    main { max-width: 980px; margin: 16px auto 60px; padding: 36px 44px; background: #fff; border: 1px solid var(--line); border-radius: 18px; }
+    main h1 { font-size: 28px; line-height: 1.35; margin: 36px 0 12px; padding-top: 12px; border-top: 2px solid var(--soft); }
+    main h1:first-child { margin-top: 0; border: 0; padding: 0; }
+    main h2 { font-size: 21px; margin: 32px 0 10px; color: var(--brand-ink); }
+    main h3 { font-size: 17px; margin: 24px 0 8px; }
+    main blockquote { margin: 16px 0; padding: 12px 18px; background: var(--soft); border-left: 4px solid var(--brand); border-radius: 0 12px 12px 0; }
+    main blockquote p { margin: 4px 0; }
+    main table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14.5px; display: block; overflow-x: auto; }
+    main th, main td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+    main th { background: #FAF9F6; white-space: nowrap; }
+    main td img { max-width: 520px; width: 100%; border: 1px solid var(--line); border-radius: 10px; }
+    main code { background: #F2F0EA; padding: 1px 6px; border-radius: 6px; font-size: 13.5px; }
+    main pre { background: #F7F5F0; padding: 14px 16px; border-radius: 12px; overflow-x: auto; font-size: 13px; line-height: 1.6; }
+    main pre code { background: none; padding: 0; }
+    main hr { border: 0; border-top: 1px solid var(--line); margin: 28px 0; }
+    .muted { color: var(--muted); }
+    @media (max-width: 760px) { main { padding: 22px 16px; border-radius: 0; margin-top: 10px; } main td img { max-width: 260px; } }
+    @media print { header, nav.tabs { display: none; } main { border: 0; padding: 0; } }
+  </style>
+</head>
+<body>
+  <header><div class="in"><a href="index.html">AX Proof · 기획서</a><span><a href="app.html" style="font-weight:600">플랫폼 열기 →</a></span></div></header>
+  <nav class="tabs" id="tabs"></nav>
+  <main id="doc"><p class="muted">불러오는 중…</p></main>
+  <script>
+    var DOCS = [
+      ['01_AXProof_서비스기획서_v2.md', '① 서비스 기획서 (Why·What·How)'],
+      ['02_사용자시나리오_v3.md', '② 사용자 시나리오'],
+      ['03_화면설계_기능명세.md', '③ 화면 설계·기능 명세'],
+      ['04_멘토피드백_반영표.md', '④ 멘토 피드백 반영표'],
+      ['05_앞으로의_방향성과_배포가이드.md', '⑤ 방향성 · 배포 가이드'],
+      ['06_플랫폼확장과실서비스전환_v1.2.md', '⑥ v1.2 확장 · 실제 연결'],
+      ['07_OBYB_멘토리뷰.md', '⑦ 링커스 OB·YB 멘토 리뷰']
+    ];
+    var tabs = document.getElementById('tabs'), doc = document.getElementById('doc');
+    function load(i) {
+      history.replaceState(null, '', '#' + (i + 1));
+      Array.prototype.forEach.call(tabs.children, function (b, j) { b.setAttribute('aria-pressed', j === i); });
+      doc.innerHTML = '<p class="muted">불러오는 중…</p>';
+      fetch('docs/' + encodeURIComponent(DOCS[i][0])).then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); }).then(function (md) {
+        doc.innerHTML = marked.parse(md);
+        Array.prototype.forEach.call(doc.querySelectorAll('img'), function (im) { var s = im.getAttribute('src'); if (s && !/^(https?:|data:|\/)/.test(s)) im.src = 'docs/' + s; im.loading = 'lazy'; });
+        Array.prototype.forEach.call(doc.querySelectorAll('a[href$=".md"]'), function (a) { var k = DOCS.findIndex(function (d) { return a.getAttribute('href').indexOf(d[0]) >= 0; }); if (k >= 0) a.onclick = function (e) { e.preventDefault(); load(k); }; });
+        window.scrollTo(0, 0);
+      }).catch(function () { doc.innerHTML = '<p>문서를 불러오지 못했어요. 서버(npm start)로 열었는지 확인하세요. 원본은 <code>AXProof_플랫폼_v1/docs</code> 폴더에 있어요.</p>'; });
+    }
+    DOCS.forEach(function (d, i) { var b = document.createElement('button'); b.textContent = d[1]; b.onclick = function () { load(i); }; tabs.appendChild(b); });
+    load(Math.max(0, Math.min(DOCS.length - 1, (parseInt(location.hash.slice(1), 10) || 1) - 1)));
+  </script>
+</body>
+</html>
