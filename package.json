@@ -1,0 +1,28 @@
+{
+  "name": "axproof-platform",
+  "version": "1.2.0",
+  "private": true,
+  "description": "AX Proof — AI 사수와 함께하는 실무 역량 훈련·검증 플랫폼",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build": "node scripts/copy-docs.js",
+    "check": "node scripts/smoke-test.js",
+    "test": "node scripts/test-platform.js && node scripts/test-providers.js && node scripts/test-ai-client.js && node scripts/test-ui.js && node scripts/test-landing.js && node scripts/test-ob-reviews.js",
+    "env:prepare": "node scripts/prepare-env.js",
+    "preflight": "node scripts/preflight.js",
+    "plan:html": "node scripts/build-plan-html.js",
+    "media:build": "node scripts/build-service-film.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0"
+  },
+  "devDependencies": {
+    "marked": "^12.0.2"
+  }
+}

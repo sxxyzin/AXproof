@@ -1,40 +1,38 @@
-import { db } from './_lib/db.js';
-import { readBody, send, fail, requireUser, nowISO, uid } from './_lib/util.js';
-import { ensurePortfolio } from './_lib/capture.js';
-export default async function handler(req, res) {
-  try {
-    const a = await requireUser(req, ['learner', 'mentor', 'admin']); const b = await readBody(req), store = db();
-    if (req.method !== 'POST') return send(res, 405, { error: 'POST만 지원합니다' });
-    const user = await store.get('users', a.uid);
-    if (b.action === 'create') {
-      if (a.role !== 'admin') return send(res, 403, { error: '운영진만 모임을 열 수 있습니다' });
-      if (!b.title || !b.startsAt || !b.cohortId || !await store.get('cohorts', b.cohortId) || !Number.isFinite(new Date(b.startsAt).getTime())) return send(res, 400, { error: '모임명·기수·일정을 확인해 주세요' });
-      const s = { id: uid('session'), cohortId: b.cohortId, title: String(b.title).slice(0, 120), startsAt: new Date(b.startsAt).toISOString(), venue: String(b.venue || '').slice(0, 300), agenda: String(b.agenda || '').slice(0, 3000), format: b.format === '온라인' ? '온라인' : '오프라인', status: '예정', participants: [], createdAt: nowISO() };
-      await store.put('sharingSessions', s); return send(res, 200, { data: s });
-    }
-    const session = await store.get('sharingSessions', b.sessionId);
-    if (!session || (a.role !== 'admin' && user.cohortId !== session.cohortId)) return send(res, 404, { error: '소속 모임을 찾을 수 없습니다' });
-    if (b.action === 'join') {
-      session.participants = [...new Set([...(session.participants || []), a.uid])]; await store.put('sharingSessions', session); return send(res, 200, { data: session });
-    }
-    if (b.action === 'complete') {
-      if (a.role !== 'admin') return send(res, 403, { error: '운영진만 모임을 마칠 수 있습니다' });
-      session.status = '완료'; await store.put('sharingSessions', session); return send(res, 200, { data: session });
-    }
-    if (b.action === 'entry') {
-      if (!['발표', '질문', '피드백', '회고'].includes(b.type) || !String(b.content || '').trim()) return send(res, 400, { error: '활동과 내용을 적어 주세요' });
-      let projectId = '';
-      if (b.projectId) { const p = await store.get('projects', b.projectId); if (!p || !(p.userId === a.uid || (p.members || []).includes(a.uid))) return send(res, 403, { error: '내 프로젝트만 연결할 수 있습니다' }); projectId = p.id; }
-      const entry = { id: uid('sharing'), sessionId: session.id, cohortId: session.cohortId, userId: a.uid, type: b.type, content: String(b.content).trim().slice(0, 5000), nextAction: String(b.nextAction || '').trim().slice(0, 2000), projectId, createdAt: nowISO() };
-      if (entry.type === '회고' && !entry.nextAction) return send(res, 400, { error: '피드백을 듣고 바꿀 행동과 이유를 적어 주세요' });
-      await store.put('sharingEntries', entry);
-      if (entry.type === '회고' && a.role === 'learner') {
-        const quote = entry.content + '\n다음 판단과 이유: ' + entry.nextAction;
-        await store.put('logs', { id: 'log_' + entry.id, userId: a.uid, projectId, stage: 'sharing', kind: '방향 전환', source: '공유시간 회고', origin: 'sharing', ref: session.id, text: quote, original: quote, edited: false, verifiedBy: null, createdAt: nowISO() });
-        await ensurePortfolio(a.uid);
-      }
-      return send(res, 200, { data: entry });
-    }
-    send(res, 400, { error: '지원하지 않는 요청' });
-  } catch (e) { fail(res, e); }
-}
+(function () {
+  var A = window.AXP, U = A.U, DB = A.DB, D = A.D, esc = U.esc, h = A.h;
+  function request(body) {
+    if (A.Mode.server) return A.api('api/sharing', { method: 'POST', body: body }).then(function (j) { return DB.load().then(function () { return j.data; }); });
+    var me = D.me(), s = DB.get('sharingSessions', body.sessionId);
+    if (body.action === 'create') return DB.put('sharingSessions', { id: U.uid('session'), cohortId: body.cohortId, title: body.title, startsAt: new Date(body.startsAt).toISOString(), venue: body.venue, agenda: body.agenda, format: body.format, status: '예정', participants: [] });
+    if (body.action === 'join') { s.participants = Array.from(new Set((s.participants || []).concat(me.id))); return DB.put('sharingSessions', s); }
+    if (body.action === 'complete') { s.status = '완료'; return DB.put('sharingSessions', s); }
+    var entry = { id: U.uid('sharing'), sessionId: s.id, cohortId: s.cohortId, userId: me.id, type: body.type, content: body.content, nextAction: body.nextAction, projectId: body.projectId, createdAt: U.now() };
+    return DB.put('sharingEntries', entry).then(function () {
+      if (entry.type === '회고' && me.role === 'learner') return D.addLog({ projectId: entry.projectId, stage: 'sharing', kind: '방향 전환', source: '공유시간 회고', ref: s.id, text: entry.content + '\n다음 판단과 이유: ' + entry.nextAction });
+    }).then(function () { return entry; });
+  }
+  function create() {
+    var md = A.modal({ title: '공유시간 열기', body: '<form id="sharingCreate" class="stack"><label>모임 이름<input name="title" required placeholder="이번 주, 내 판단이 바뀐 순간"></label><label>기수<select name="cohortId">' + DB.all('cohorts').map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join('') + '</select></label><label>일시<input name="startsAt" type="datetime-local" required></label><label>만나는 방식<select name="format"><option>오프라인</option><option>온라인</option></select></label><label>장소 또는 모임 링크<input name="venue" required></label><label>진행 순서<textarea name="agenda" rows="3" placeholder="체크인 → 발표 → 질문·피드백 → 회고"></textarea></label><button class="btn" type="submit">모임 만들기</button></form>' });
+    U.$('form', md.body).onsubmit = function (e) { e.preventDefault(); var b = Object.fromEntries(new FormData(e.target)); b.action = 'create'; request(b).then(function () { md.close(); A.render(); }).catch(function (x) { A.toast(x.message, true); }); };
+  }
+  function screen(el) {
+    var me = D.me(), selected = U.ls.get('axp:sharing:selected', '');
+    var sessions = DB.all('sharingSessions').filter(function (s) { return me.role === 'admin' || s.cohortId === me.cohortId; }).sort(function (a, b) { return b.startsAt.localeCompare(a.startsAt); });
+    var session = sessions.find(function (s) { return s.id === selected; }) || sessions[0];
+    el.innerHTML = h.head('공유시간', '오프라인에서 만나고, 서로의 판단을 듣고, 다음 시도를 함께 정해요.', me.role === 'admin' ? '<button class="btn" id="sharingNew">공유시간 열기</button>' : '') +
+      '<div class="community-hero"><span class="eyebrow">링커스의 만남을 이어가는 공간</span><h2>혼자 해낸 일도,<br>함께 나누면 다음 실험이 됩니다.</h2><p>발표를 잘하는 자리보다, 막힌 지점과 바뀐 판단을 솔직하게 나누는 시간. 모임 전에는 준비하고, 만난 뒤에는 배움을 내 기록으로 남겨요.</p></div>' +
+      '<div class="sharing-layout mt24"><aside class="stack">' + (sessions.length ? sessions.map(function (s) { return '<button class="session-card' + (session.id === s.id ? ' selected' : '') + '" data-session="' + esc(s.id) + '"><span class="badge ' + (s.status === '완료' ? '' : 'green') + '">' + esc(s.status) + ' · ' + esc(s.format) + '</span><b>' + esc(s.title) + '</b><span class="small muted">' + esc(new Date(s.startsAt).toLocaleString('ko-KR', { month: 'long', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' })) + '</span></button>'; }).join('') : h.empty('아직 예정된 공유시간이 없어요.')) + '</aside><div id="sharingRoom"></div></div>';
+    var newBtn = U.$('#sharingNew', el); if (newBtn) newBtn.onclick = create;
+    U.$$('[data-session]', el).forEach(function (b) { b.onclick = function () { U.ls.set('axp:sharing:selected', b.getAttribute('data-session')); screen(el); }; });
+    if (!session) return;
+    var entries = DB.where('sharingEntries', function (e) { return e.sessionId === session.id; }), room = U.$('#sharingRoom', el);
+    room.innerHTML = '<div class="card"><div class="row between"><span class="badge green">' + esc(session.format) + ' 모임</span><button class="btn soft sm" id="sharingJoin">' + ((session.participants || []).includes(me.id) ? '참여 예정 ✓' : '참여할게요') + '</button></div><h2 class="mt16">' + esc(session.title) + '</h2><p class="muted mt8">' + esc(session.venue) + '</p><div class="note mt16">' + esc(session.agenda) + '</div><p class="small muted mt12">참여 예정 ' + (session.participants || []).length + '명 · 발표 ' + entries.filter(function (e) { return e.type === '발표'; }).length + '개 · 회고 ' + entries.filter(function (e) { return e.type === '회고'; }).length + '개</p>' + (me.role === 'admin' && session.status !== '완료' ? '<button class="btn ghost sm mt12" id="sharingComplete">이번 모임 마치기</button>' : '') + '</div>' +
+      '<div class="card mt16"><h2>이번 시간에 나눌 이야기</h2><form id="sharingEntry" class="stack mt16"><div class="grid g2"><label>활동<select name="type" id="sharingType"><option>발표</option><option>질문</option><option>피드백</option><option>회고</option></select></label><label>내 프로젝트<select name="projectId"><option value="">모임 전체 이야기</option>' + D.myProjects().map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.title) + '</option>'; }).join('') + '</select></label></div><label>이야기<textarea name="content" rows="4" required placeholder="어떤 시도를 했고, 어디서 막혔고, 어떤 판단이 바뀌었나요?"></textarea></label><label id="sharingNextWrap" hidden>피드백을 듣고 바꿀 행동과 이유<textarea name="nextAction" rows="3" placeholder="어떤 의견을 받아들이고, 무엇은 보류할까요? 그 이유는요?"></textarea></label><p class="small muted">발표·질문·피드백은 우리 기수 안에서 나눠요. 회고의 내 판단은 비공개 포트폴리오에도 자동으로 쌓입니다.</p><button class="btn" type="submit">공유시간에 남기기</button></form></div>' +
+      '<div class="stack mt16">' + (entries.length ? entries.slice().reverse().map(function (e) { return '<article class="card"><div class="row between"><b>' + esc(D.user(e.userId).name) + '</b><span class="badge ' + (e.type === '회고' ? 'green' : 'blue') + '">' + esc(e.type) + '</span></div><p class="pre mt12">' + esc(e.content) + '</p>' + (e.nextAction ? '<div class="tip good mt12"><b>다음 행동과 이유</b><p>' + esc(e.nextAction) + '</p></div>' : '') + '<span class="tiny muted">' + U.fmt(e.createdAt, true) + '</span></article>'; }).join('') : '<div class="card"><p class="muted">첫 이야기를 남겨 보세요. 완성된 결과가 아니어도 괜찮아요.</p></div>') + '</div>';
+    U.$('#sharingJoin', room).onclick = function () { request({ action: 'join', sessionId: session.id }).then(function () { screen(el); }).catch(function (e) { A.toast(e.message, true); }); };
+    var complete = U.$('#sharingComplete', room); if (complete) complete.onclick = function () { request({ action: 'complete', sessionId: session.id }).then(function () { screen(el); }); };
+    U.$('#sharingType', room).onchange = function (e) { var reflection = e.target.value === '회고'; U.$('#sharingNextWrap', room).hidden = !reflection; U.$('[name=nextAction]', room).required = reflection; };
+    U.$('#sharingEntry', room).onsubmit = function (e) { e.preventDefault(); var button = U.$('button[type=submit]', e.target); button.disabled = true; var b = Object.fromEntries(new FormData(e.target)); b.action = 'entry'; b.sessionId = session.id; request(b).then(function () { A.toast(b.type === '회고' ? '회고와 내 판단이 저장됐어요' : '공유시간에 남겼어요'); screen(el); }).catch(function (x) { A.toast(x.message, true); button.disabled = false; }); };
+  }
+  ['learner', 'mentor', 'admin'].forEach(function (role) { A.route(role, '#/sharing', screen); });
+})();

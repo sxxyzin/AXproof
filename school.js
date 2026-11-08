@@ -1,165 +1,91 @@
-import crypto from 'node:crypto';
-import { db } from './_lib/db.js';
-import { readBody, query, send, fail, requireUser, uid, nowISO } from './_lib/util.js';
-import { generate, keyFor } from './_lib/providers.js';
-import { aiSettings, logUsage } from './ai.js';
-import { takeAIQuota } from './_lib/quota.js';
-
-const failWith = (status, message) => { throw Object.assign(new Error(message), { status }); };
-const text = (v, max = 4000) => String(v || '').trim().slice(0, max);
-const fields = ['조건 확인', '근거 대조', '선택 이유', '피드백 대응'];
-const levels = ['미확인', '도움을 받은 뒤 수행', '스스로 수행'];
-const belongs = (c, a) => a.role === 'admin' || (c.teacherIds || []).includes(a.uid) || (c.studentIds || []).includes(a.uid) || (c.guardianIds || []).includes(a.uid);
-const teaches = (c, a) => a.role === 'admin' || (a.role === 'teacher' && (c.teacherIds || []).includes(a.uid));
-async function consentFor(studentId) { return (await db().list('schoolConsents')).find(c => c.studentId === studentId && c.status === 'verified'); }
-async function classroom(id, a) { const c = await db().get('schoolClasses', id); if (!c || !belongs(c, a)) failWith(404, '접근할 수 없는 반입니다'); return c; }
-async function attemptFor(id, a, teacher = false) {
-  const t = await db().get('schoolAttempts', id);
-  if (!t) failWith(404, '학습 기록이 없습니다');
-  const c = await classroom(t.classId, a);
-  if (teacher ? !teaches(c, a) : !(teaches(c, a) || t.userId === a.uid)) failWith(403, '이 학습 기록을 바꿀 수 없습니다');
-  return { t, c };
-}
-export default async function handler(req, res) {
-  try {
-    const a = await requireUser(req);
-    const user = await db().get('users', a.uid);
-    if (!user || user.role !== a.role) failWith(401, '다시 로그인해 주세요');
-    const store = db();
-    if (req.method === 'GET') {
-      const classes = (await store.list('schoolClasses')).filter(c => belongs(c, a));
-      const ids = new Set(classes.map(c => c.id));
-      const consents = (await store.list('schoolConsents')).filter(c => ids.has(c.classId) && (a.role === 'admin' || a.role === 'teacher' || c.guardianId === a.uid || c.studentId === a.uid));
-      const childIds = new Set(consents.filter(c => c.guardianId === a.uid && c.status === 'verified').map(c => c.studentId));
-      const attempts = (await store.list('schoolAttempts')).filter(t => ids.has(t.classId) && (a.role === 'admin' || a.role === 'teacher' || t.userId === a.uid));
-      const reports = (await store.list('schoolReports')).filter(r => ids.has(r.classId) && (a.role === 'admin' || a.role === 'teacher' || (r.approvedAt && (r.studentId === a.uid || childIds.has(r.studentId)))));
-      const missions = (await store.list('schoolMissions')).filter(m => (!m.classId || ids.has(m.classId)) && (m.reviewed || ['teacher', 'admin'].includes(a.role))).map(m => {
-        if (['teacher', 'admin'].includes(a.role)) return m;
-        const { aiExample, ...safe } = m; return safe;
-      });
-      const visibleUserIds = new Set([a.uid]);
-      if (['teacher', 'admin'].includes(a.role)) classes.forEach(c => [...(c.teacherIds || []), ...(c.studentIds || []), ...(c.guardianIds || [])].forEach(id => visibleUserIds.add(id)));
-      if (a.role === 'guardian') consents.filter(c => c.guardianId === a.uid).forEach(c => visibleUserIds.add(c.studentId));
-      const users = (await store.list('users')).filter(u => visibleUserIds.has(u.id)).map(u => ({ id: u.id, name: u.name, role: u.role, ageBand: u.ageBand || '' }));
-      return send(res, 200, { classes, consents, attempts, reports, missions, users });
-    }
-    if (req.method !== 'POST') return send(res, 405, { error: '지원하지 않는 요청' });
-    const b = await readBody(req);
-    if (b.action === 'createClass') {
-      if (a.role !== 'admin') failWith(403, '운영진만 반을 만들 수 있습니다');
-      if (!text(b.name)) failWith(400, '반 이름을 적어 주세요');
-      const c = { id: uid('cls'), name: text(b.name, 80), level: text(b.level, 30) || '초5–6', teacherIds: [], studentIds: [], guardianIds: [], createdAt: nowISO() };
-      await store.put('schoolClasses', c); return send(res, 200, { data: c });
-    }
-    if (b.action === 'enroll') {
-      const c = await classroom(b.classId, a);
-      if (!teaches(c, a)) failWith(403, '담당 교사만 학생을 등록할 수 있습니다');
-      const role = ['teacher', 'guardian', 'student'].includes(b.role) ? b.role : 'student';
-      if (a.role !== 'admin' && role !== 'student') failWith(403, '성인 계정은 운영진이 등록합니다');
-      const email = text(b.email, 200).toLowerCase(), name = text(b.name, 30), password = String(b.password || '');
-      if (!name || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || password.length < 12 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) failWith(400, '이름·로그인 이메일과 영문·숫자를 포함한 12자 이상 임시 비밀번호가 필요합니다');
-      if ((await store.list('users')).some(u => u.email === email)) failWith(409, '이미 등록한 이메일입니다');
-      const guardian = role === 'student' ? await store.get('users', b.guardianId) : null;
-      if (role === 'student' && (!guardian || guardian.role !== 'guardian' || !(c.guardianIds || []).includes(guardian.id))) failWith(400, '이 반의 보호자 계정을 먼저 연결해 주세요');
-      const u = { id: uid('usr'), role, name, email, audience: 'school', ageBand: text(b.ageBand, 30), schoolClassId: c.id, createdAt: nowISO(), authVersion: 1 };
-      const salt = crypto.randomBytes(16).toString('hex');
-      await store.put('users', u); await store.put('creds', { id: u.id, salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') });
-      const key = role === 'student' ? 'studentIds' : role === 'teacher' ? 'teacherIds' : 'guardianIds';
-      c[key] = [...new Set([...(c[key] || []), u.id])]; await store.put('schoolClasses', c);
-      if (guardian) await store.put('schoolConsents', { id: 'consent_' + u.id, classId: c.id, studentId: u.id, guardianId: guardian.id, status: 'requested', createdAt: nowISO() });
-      return send(res, 200, { user: { id: u.id, name, role }, message: guardian ? '보호자 동의와 교사 확인 후 미션이 열립니다' : '계정이 등록됐습니다' });
-    }
-    if (b.action === 'deleteStudent') {
-      if (a.role !== 'admin') failWith(403, '운영진만 삭제 요청을 처리할 수 있습니다');
-      const consent = await store.get('schoolConsents', b.consentId);
-      if (!consent?.deletionRequestedAt) failWith(400, '보호자의 삭제 요청을 먼저 확인해 주세요');
-      for (const col of ['schoolAttempts', 'schoolReports']) for (const r of await store.list(col)) if (r.userId === consent.studentId || r.studentId === consent.studentId) await store.del(col, r.id);
-      const c = await store.get('schoolClasses', consent.classId); if (c) { c.studentIds = (c.studentIds || []).filter(id => id !== consent.studentId); await store.put('schoolClasses', c); }
-      await store.del('creds', consent.studentId); await store.del('users', consent.studentId); await store.del('schoolConsents', consent.id);
-      return send(res, 200, { ok: true });
-    }
-    if (b.action === 'consent' || b.action === 'verifyConsent' || b.action === 'withdrawConsent' || b.action === 'requestDeletion') {
-      const consent = await store.get('schoolConsents', b.consentId);
-      if (!consent) failWith(404, '동의 기록이 없습니다');
-      const c = await classroom(consent.classId, a);
-      if (b.action === 'verifyConsent') {
-        if (!teaches(c, a) || !consent.acceptedAt || !text(b.verificationNote)) failWith(400, '보호자 동의 후 확인 방법을 남겨 주세요');
-        consent.status = 'verified'; consent.verifiedAt = nowISO(); consent.verifiedBy = a.uid; consent.verificationNote = text(b.verificationNote, 500);
-      } else {
-        if (consent.guardianId !== a.uid) failWith(403, '연결된 보호자만 동의를 변경할 수 있습니다');
-        if (b.action === 'consent' && consent.deletionRequestedAt) failWith(409, '삭제 요청 처리 중입니다. 운영진에게 문의해 주세요');
-        consent.status = b.action === 'withdrawConsent' || b.action === 'requestDeletion' ? 'withdrawn' : 'accepted';
-        if (b.action === 'requestDeletion') consent.deletionRequestedAt = nowISO();
-        if (b.action === 'consent') { consent.acceptedAt = nowISO(); consent.noticeVersion = 'school-2026-11'; }
-        consent.verifiedAt = null;
-      }
-      await store.put('schoolConsents', consent); return send(res, 200, { data: consent });
-    }
-    if (b.action === 'saveMission') {
-      if (!['teacher', 'admin'].includes(a.role)) failWith(403, '교사만 수업을 검토할 수 있습니다');
-      const c = await classroom(b.classId, a); if (!teaches(c, a)) failWith(403, '담당 반이 아닙니다');
-      const m = { id: uid('mission'), classId: c.id, title: text(b.title, 100), level: text(b.level, 30), conditions: text(b.conditions), resources: text(b.resources), aiExample: text(b.aiExample), question: text(b.question), reviewed: true, reviewedBy: a.uid, reviewedAt: nowISO() };
-      if (![m.title, m.conditions, m.resources, m.aiExample, m.question].every(Boolean)) failWith(400, '조건·자료·AI 예시·점검 질문을 모두 검토해 주세요');
-      await store.put('schoolMissions', m); return send(res, 200, { data: m });
-    }
-    if (b.action === 'start') {
-      if (a.role !== 'student') failWith(403, '학생 계정에서 미션을 시작해 주세요');
-      const consent = await consentFor(a.uid); if (!consent) failWith(403, '보호자 동의와 교사 확인 후 시작할 수 있어요');
-      const c = await classroom(consent.classId, a), mission = await store.get('schoolMissions', b.missionId);
-      if (!mission || !mission.reviewed || (mission.classId && mission.classId !== c.id)) failWith(404, '검토된 미션이 없습니다');
-      const existing = (await store.list('schoolAttempts')).find(t => t.userId === a.uid && t.missionId === mission.id && !t.submittedAt);
-      const t = existing || { id: uid('attempt'), classId: c.id, userId: a.uid, missionId: mission.id, phase: 0, thoughts: '', comparison: '', choice: '', reason: '', observations: {}, createdAt: nowISO() };
-      await store.put('schoolAttempts', t); return send(res, 200, { data: t });
-    }
-    if (['think', 'reveal', 'submit', 'observe', 'draftReport', 'approveReport'].includes(b.action)) {
-      const { t, c } = await attemptFor(b.attemptId, a, ['observe', 'draftReport', 'approveReport'].includes(b.action));
-      if (['think', 'reveal', 'submit'].includes(b.action)) {
-        if (a.role !== 'student' || t.userId !== a.uid || !(await consentFor(a.uid))) failWith(403, '동의된 학생 본인만 미션을 진행할 수 있어요');
-        if (t.submittedAt) failWith(409, '이미 마친 미션입니다');
-      }
-      if (b.action === 'think') {
-        if (t.aiSeenAt) failWith(409, 'AI를 보기 전에 적은 원문은 보존됩니다');
-        t.thoughts = text(b.thoughts); if (t.thoughts.length < 5) failWith(400, '먼저 지켜야 할 조건과 내 생각을 적어 주세요'); t.phase = 1;
-      }
-      if (b.action === 'reveal') {
-        if (!t.thoughts || t.phase < 1) failWith(400, '내 생각을 먼저 적어 주세요');
-        const m = await store.get('schoolMissions', t.missionId); if (!m || !m.reviewed) failWith(409, '선생님의 검토가 필요해요');
-        t.aiSeenAt = t.aiSeenAt || nowISO(); t.revealedExample = m.aiExample; t.phase = 2;
-      }
-      if (b.action === 'submit') {
-        if (!t.aiSeenAt) failWith(400, '내 생각과 AI 예시를 먼저 비교해 주세요');
-        t.comparison = text(b.comparison); t.choice = text(b.choice, 30); t.reason = text(b.reason);
-        if (!t.comparison || !t.reason || !['그대로 쓰기', '고쳐서 쓰기', '더 확인하기'].includes(t.choice)) failWith(400, '비교한 근거와 선택 이유를 적어 주세요');
-        t.phase = 3; t.submittedAt = nowISO();
-      }
-      if (b.action === 'observe') {
-        if (!t.submittedAt) failWith(400, '마친 미션부터 관찰해 주세요');
-        t.observations = Object.fromEntries(fields.map(k => [k, levels.includes(b.observations?.[k]) ? b.observations[k] : '미확인']));
-        t.teacherNote = text(b.teacherNote); t.observedBy = a.uid; t.observedAt = nowISO();
-      }
-      if (b.action === 'draftReport') {
-        if (!t.observedAt) failWith(400, '교사의 관찰 기록을 먼저 남겨 주세요');
-        let nextPractice = '다음 미션에서는 조건과 자료를 먼저 비교하고, 왜 골랐는지 한 문장으로 말해 보세요.';
-        const cfg = await aiSettings(); const provider = keyFor(cfg.provider) ? cfg.provider : '';
-        if (provider) {
-          await takeAIQuota(a);
-          const out = await generate({ provider, model: cfg.models[provider].quick, effort: 'low', maxTokens: 1200,
-            system: '아이의 실제 말과 교사의 관찰만 바탕으로 다음 연습 한 가지와 보호자가 할 질문 한 가지를 한국어 두 문장으로 제안한다. 진단·점수·순위·성격 추정·새로운 사실은 만들지 않는다. 이름 등 개인정보는 입력되지 않는다.',
-            messages: [{ role: 'user', content: JSON.stringify({ quote: t.reason, observations: t.observations, teacherNote: t.teacherNote }) }] });
-          nextPractice = out.text; await logUsage(a, 'school_report', provider, out.model, out.usage);
-        }
-        const r = { id: 'report_' + t.id, attemptId: t.id, classId: c.id, studentId: t.userId, quote: t.reason, thoughts: t.thoughts, observations: t.observations, teacherNote: t.teacherNote, nextPractice, status: '검토 대기', draftedBy: a.uid, aiAssisted: !!provider, updatedAt: nowISO() };
-        await store.put('schoolReports', r); return send(res, 200, { data: r });
-      }
-      if (b.action === 'approveReport') {
-        const r = await store.get('schoolReports', 'report_' + t.id);
-        if (!r || !(await consentFor(t.userId))) failWith(400, '동의와 리포트 초안을 확인해 주세요');
-        r.teacherNote = text(b.teacherNote || r.teacherNote); r.nextPractice = text(b.nextPractice || r.nextPractice);
-        r.status = '교사 확인 완료'; r.approvedAt = nowISO(); r.approvedBy = a.uid;
-        await store.put('schoolReports', r); return send(res, 200, { data: r });
-      }
-      t.updatedAt = nowISO(); await store.put('schoolAttempts', t); return send(res, 200, { data: t });
-    }
-    failWith(400, '지원하지 않는 요청입니다');
-  } catch (e) { fail(res, e); }
-}
+(function () {
+  var A = window.AXP, U = A.U, DB = A.DB, D = A.D, esc = U.esc, h = A.h;
+  var S = A.School = { state: null };
+  var areas = ['조건 확인', '근거 대조', '선택 이유', '피드백 대응'], levels = ['미확인', '도움을 받은 뒤 수행', '스스로 수행'];
+  function load() {
+    if (A.Mode.server) return A.api('api/school').then(function (r) { S.state = r; return r; });
+    var me = D.me();
+    S.state = { classes: DB.all('schoolClasses'), consents: DB.all('schoolConsents'), missions: DB.all('schoolMissions'), users: DB.all('users'), attempts: DB.all('schoolAttempts').filter(function (t) { return me.role !== 'student' || t.userId === me.id; }), reports: DB.all('schoolReports').filter(function (r) { return ['teacher', 'admin'].includes(me.role) || (r.approvedAt && (me.role === 'guardian' || r.studentId === me.id)); }) };
+    return Promise.resolve(S.state);
+  }
+  function request(body) {
+    if (A.Mode.server) return A.api('api/school', { method: 'POST', body: body }).then(function (r) { return load().then(function () { return r.data || r; }); });
+    var me = D.me(), t = DB.get('schoolAttempts', body.attemptId), r = t && DB.get('schoolReports', 'report_' + t.id), c;
+    if (body.action === 'createClass') return DB.put('schoolClasses', { id: U.uid('cls'), name: body.name, level: body.level, teacherIds: [], studentIds: [], guardianIds: [] }).then(load);
+    if (body.action === 'enroll') return Promise.reject(new Error('실제 계정 등록은 서버로 실행한 운영진 화면에서 진행해 주세요. 데모에서는 역할별 둘러보기를 이용하세요.'));
+    if (body.action === 'start') {
+      t = DB.where('schoolAttempts', function (x) { return x.userId === me.id && x.missionId === body.missionId && !x.submittedAt; })[0] || { id: U.uid('attempt'), classId: me.schoolClassId, userId: me.id, missionId: body.missionId, phase: 0, observations: {} };
+    } else if (body.action === 'think') { t.thoughts = body.thoughts; t.phase = 1; }
+    else if (body.action === 'reveal') { if (!t.thoughts) return Promise.reject(new Error('내 생각을 먼저 적어 주세요')); t.aiSeenAt = U.now(); t.revealedExample = DB.get('schoolMissions', t.missionId).aiExample; t.phase = 2; }
+    else if (body.action === 'submit') { Object.assign(t, { comparison: body.comparison, choice: body.choice, reason: body.reason, phase: 3, submittedAt: U.now() }); }
+    else if (body.action === 'observe') { t.observations = body.observations; t.teacherNote = body.teacherNote; t.observedAt = U.now(); }
+    else if (body.action === 'draftReport') return DB.put('schoolReports', { id: 'report_' + t.id, attemptId: t.id, classId: t.classId, studentId: t.userId, quote: t.reason, thoughts: t.thoughts, observations: t.observations, teacherNote: t.teacherNote, nextPractice: '다음에는 처음 보는 자료에서 조건을 스스로 찾아보세요. 집에서는 “왜 그렇게 골랐어?”라고 한 번 물어봐 주세요.', status: '검토 대기', aiAssisted: false }).then(function (x) { return load().then(function () { return x; }); });
+    else if (body.action === 'approveReport') { r.approvedAt = U.now(); r.status = '교사 확인 완료'; r.nextPractice = body.nextPractice; r.teacherNote = body.teacherNote; return DB.put('schoolReports', r).then(load); }
+    else if (body.action === 'consent' || body.action === 'verifyConsent' || body.action === 'withdrawConsent') { c = DB.get('schoolConsents', body.consentId); c.status = body.action === 'consent' ? 'accepted' : body.action === 'withdrawConsent' ? 'withdrawn' : 'verified'; c.acceptedAt = U.now(); return DB.put('schoolConsents', c).then(load); }
+    else if (body.action === 'saveMission') return DB.put('schoolMissions', Object.assign({ id: U.uid('mission'), reviewed: true, reviewedBy: me.id, reviewedAt: U.now() }, body)).then(load);
+    return DB.put('schoolAttempts', t).then(function (x) { return load().then(function () { return x; }); });
+  }
+  function guarded(button, promise, done) { if (button) button.disabled = true; promise.then(done || A.render).catch(function (e) { A.toast(e.message, true); }).finally(function () { if (button) button.disabled = false; }); }
+  function name(id) { return ((S.state.users || []).find(function (u) { return u.id === id; }) || {}).name || '학습자'; }
+  function intro(el) {
+    var me = D.me(), edu = ['student', 'teacher', 'guardian', 'admin'].includes(me.role);
+    el.innerHTML = h.head('초중고 · 생각하는 힘', '내 생각 먼저 → AI 예시와 비교 → 내 선택 설명. 짧게, 자주 연습해요.') +
+      '<div class="school-hero"><div><span class="eyebrow">AX Proof 교육 프로그램</span><h2>AI보다 먼저,<br>내 생각이 시작되는 교실.</h2><p>정답을 빨리 얻는 연습에서 한 걸음 더. 조건을 살피고, 근거를 비교하고, 스스로 고른 이유를 말하는 4주 과정입니다.</p><div class="row mt24"><span class="pill">주 1회 45분 함께</span><span class="pill">주 2회 10분 미션</span><span class="pill">점수보다 구체적인 장면</span></div></div><div class="school-steps"><span>01 <b>내 생각 먼저</b></span><span>02 <b>AI가 맞는지 확인</b></span><span>03 <b>내 선택과 이유</b></span><span>04 <b>함께 나누고 다시 시도</b></span></div></div>' +
+      '<div class="grid g3 mt24"><div class="card"><span class="badge green">아이</span><h3 class="mt12">생활 속 짧은 미션</h3><p class="small muted mt8">교사가 검토한 AI 예시로 생각을 연습해요. 외부 AI 계정을 만들 필요가 없어요.</p></div><div class="card"><span class="badge gold">교사·강사</span><h3 class="mt12">도움을 조금씩 줄이기</h3><p class="small muted mt8">조건 확인·근거 대조·선택 이유·피드백 대응을 장면으로 관찰해요.</p></div><div class="card"><span class="badge blue">보호자</span><h3 class="mt12">아이의 말로 보는 성장</h3><p class="small muted mt8">선생님이 확인한 리포트로 아이의 실제 선택과 집에서 해 볼 질문을 만나요.</p></div></div>' +
+      (!edu ? '<div class="card mt24"><h2>프로그램 체험</h2><p class="muted mt8">대학생·취준생의 실무 훈련과 같은 사이트 안에서, 초중고는 별도의 학습 공간을 사용합니다.</p><div class="row mt16"><a class="btn" href="app.html?as=student#/school">학생으로 체험</a><a class="btn ghost" href="app.html?as=teacher#/school">교사로 체험</a><a class="btn ghost" href="app.html?as=guardian#/school">보호자로 체험</a></div><p class="tiny muted mt12">둘러보기가 켜진 환경에서만 가상 계정으로 체험할 수 있어요. 실제 과정은 기관·보호자 확인 후 초대로 참여합니다.</p></div>' : '<div id="schoolWorkspace" class="mt24"><p class="muted">수업을 불러오는 중…</p></div>') +
+      '<div class="note mt24">학습 기록은 기본 비공개이며 채용용 포트폴리오로 넘어가지 않습니다. 학생 참여는 보호자 동의와 담당자의 확인 후 열립니다.</div>';
+    if (edu) load().then(function () { var work = U.$('#schoolWorkspace', el); if (me.role === 'student') student(work); else if (me.role === 'guardian') guardian(work); else teacher(work); }).catch(function (e) { U.$('#schoolWorkspace', el).innerHTML = '<div class="note red">' + esc(e.message) + '</div>'; });
+  }
+  function student(el) {
+    var me = D.me(), consent = S.state.consents.find(function (c) { return c.studentId === me.id && c.status === 'verified'; });
+    if (!consent) { el.innerHTML = '<div class="card"><h2>함께 준비하고 있어요</h2><p class="muted mt12">보호자의 동의와 선생님의 확인이 끝나면 미션을 시작할 수 있어요.</p></div>'; return; }
+    el.innerHTML = '<div class="row between"><h2>오늘의 생각 미션</h2><label class="small">과정 <select id="schoolLevel" style="width:auto"><option>초5–6</option><option>초1–4</option><option>중학생</option><option>고등학생</option></select></label></div><div id="schoolMissionList" class="grid g2 mt16"></div><h2 class="mt24">내가 남긴 생각</h2><div class="stack mt12">' + (S.state.attempts.length ? S.state.attempts.map(function (t) { var m = S.state.missions.find(function (x) { return x.id === t.missionId; }); return '<a class="card" href="#/school/attempt/' + esc(t.id) + '"><span class="badge ' + (t.submittedAt ? 'green' : 'gold') + '">' + (t.submittedAt ? '미션 완료' : '이어서 하기') + '</span><h3 class="mt8">' + esc(m ? m.title : '생각 미션') + '</h3>' + (t.reason ? '<p class="small mt8">“' + esc(t.reason) + '”</p>' : '') + '</a>'; }).join('') : '<p class="muted">첫 미션에서 내 생각을 남겨 보세요.</p>') + '</div>';
+    var select = U.$('#schoolLevel', el); if (me.ageBand) select.value = me.ageBand;
+    function cards() { U.$('#schoolMissionList', el).innerHTML = S.state.missions.filter(function (m) { return m.reviewed && m.level === select.value; }).map(function (m) { return '<article class="card"><span class="badge green">' + esc(m.level) + ' · 약 10분</span><h3 class="mt12">' + esc(m.title) + '</h3><p class="small muted mt8">' + esc(m.conditions) + '</p><button class="btn mt16" data-start="' + esc(m.id) + '">내 생각부터 시작</button></article>'; }).join(''); U.$$('[data-start]', el).forEach(function (b) { b.onclick = function () { guarded(b, request({ action: 'start', missionId: b.getAttribute('data-start') }), function (t) { A.go('#/school/attempt/' + t.id); }); }; }); }
+    select.onchange = cards; cards();
+  }
+  function attempt(el, prm) {
+    el.innerHTML = '<p class="muted">미션을 불러오는 중…</p>';
+    load().then(function () {
+      var t = S.state.attempts.find(function (x) { return x.id === prm.id; }), m = t && S.state.missions.find(function (x) { return x.id === t.missionId; });
+      if (!t || !m || t.userId !== D.me().id) { el.innerHTML = h.empty('내 미션을 찾을 수 없어요.'); return; }
+      el.innerHTML = h.head(m.title, esc(m.level) + ' · 선생님이 검토한 AI 예시', '<a class="btn ghost" href="#/school">수업으로</a>') +
+        '<div class="learning-path">' + ['내 생각 먼저', 'AI 예시와 비교', '내 선택과 이유', '내 생각 돌아보기'].map(function (s, i) { return '<span class="' + (i <= (t.phase || 0) ? 'active' : '') + '">' + (i + 1) + '. ' + s + '</span>'; }).join('') + '</div><div class="mission-layout mt24"><div class="card"><span class="badge green">오늘 지켜야 할 조건</span><p class="pre mt16">' + esc(m.conditions) + '</p><h3 class="mt24">확인할 자료</h3><p class="pre mt12">' + esc(m.resources) + '</p></div><div class="card" id="missionWork"></div></div>';
+      var work = U.$('#missionWork', el);
+      if (!t.aiSeenAt) {
+        work.innerHTML = '<h2>AI를 보기 전에, 내 생각부터</h2><p class="muted mt8">무엇을 지켜야 할까요? 어떻게 해 보고 싶나요?</p><form class="stack mt16"><label>내 생각<textarea name="thoughts" rows="6" minlength="5" required>' + esc(t.thoughts || '') + '</textarea></label><button class="btn" type="submit">내 생각 저장하고 AI 예시 보기</button></form>';
+        U.$('form', work).onsubmit = function (e) { e.preventDefault(); var text = new FormData(e.target).get('thoughts'); guarded(U.$('button', e.target), request({ action: 'think', attemptId: t.id, thoughts: text }).then(function () { return request({ action: 'reveal', attemptId: t.id }); })); };
+      } else if (!t.submittedAt) {
+        work.innerHTML = '<span class="badge gold">교사가 검토한 AI 예시 · 틀린 내용이 있을 수 있어요</span><p class="pre mt16">' + esc(t.revealedExample) + '</p><div class="note mt16"><b>생각 점검 질문</b><p>' + esc(m.question) + '</p></div><details class="mt16"><summary>AI를 보기 전 내 생각</summary><p class="pre mt8">' + esc(t.thoughts) + '</p></details><form class="stack mt16"><label>자료와 비교해서 발견한 점<textarea name="comparison" rows="3" required></textarea></label><label>내 선택<select name="choice"><option>고쳐서 쓰기</option><option>더 확인하기</option><option>그대로 쓰기</option></select></label><label>그렇게 고른 이유<textarea name="reason" rows="4" required placeholder="나는 이렇게 골랐어요. 왜냐하면…"></textarea></label><button class="btn" type="submit">내 선택과 이유 남기기</button></form>';
+        U.$('form', work).onsubmit = function (e) { e.preventDefault(); var b = Object.fromEntries(new FormData(e.target)); b.action = 'submit'; b.attemptId = t.id; guarded(U.$('button', e.target), request(b)); };
+      } else work.innerHTML = '<span class="badge green">내 생각이 저장됐어요</span><h2 class="mt16">“' + esc(t.reason) + '”</h2><div class="note mt16"><b>내가 비교한 근거</b><p class="pre">' + esc(t.comparison) + '</p></div><p class="muted mt16">다음 수업에서는 이 판단을 친구들과 나누고, 다른 선택도 들어 보세요. 선생님의 관찰은 보호자 리포트로 이어져요.</p><a class="btn mt24" href="#/school">다른 미션 보기</a>';
+    }).catch(function (e) { el.innerHTML = '<div class="note red">' + esc(e.message) + '</div>'; });
+  }
+  function guardian(el) {
+    var me = D.me(), consents = S.state.consents.filter(function (c) { return c.guardianId === me.id; });
+    el.innerHTML = '<h2>우리 아이의 생각을 만나는 곳</h2><p class="muted mt8">점수나 순위 대신, 아이가 실제로 한 말과 선생님이 관찰한 장면을 봅니다.</p><div class="card mt16"><h3>수집과 열람 안내</h3><p class="small mt8">미션의 내 생각·선택·이유와 교사 관찰을 기록합니다. 학생 본인·담당 교사·연결된 보호자만 열람하며 채용에 제공하지 않습니다. 보관 기간과 삭제 절차는 과정 운영 안내를 따릅니다. 동의를 철회하거나 아래에서 삭제를 요청할 수 있습니다.</p></div><div class="stack mt16">' + consents.map(function (c) { return '<div class="card"><div class="row between"><b>' + esc(name(c.studentId)) + ' · 보호자 연결</b><span class="badge green">' + esc({ verified: '동의 확인 완료', accepted: '교사 확인 대기', requested: '동의 전', withdrawn: '동의 철회' }[c.status] || c.status) + '</span></div><button class="btn ghost sm mt12" data-consent="' + esc(c.id) + '" data-action="' + (c.status === 'verified' || c.status === 'accepted' ? 'withdrawConsent' : 'consent') + '">' + (c.status === 'verified' || c.status === 'accepted' ? '동의 철회' : '안내를 확인하고 학습 기록에 동의') + '</button><button class="btn ghost sm mt12" data-delete-request="' + esc(c.id) + '">' + (c.deletionRequestedAt ? '삭제 요청 접수됨' : '학생 기록 삭제 요청') + '</button></div>'; }).join('') + '</div><h2 class="mt24">선생님이 확인한 주간 리포트</h2><div class="stack mt16">' + (S.state.reports.length ? S.state.reports.map(reportHTML).join('') : '<div class="card"><p class="muted">선생님이 관찰하고 확인한 리포트가 이곳에 도착해요.</p></div>') + '</div>';
+    U.$$('[data-delete-request]', el).forEach(function (b) { b.onclick = function () { if (!A.Mode.server) return A.toast('실제 삭제 요청은 서버 실행 시 가능합니다.'); guarded(b, request({ action: 'requestDeletion', consentId: b.getAttribute('data-delete-request') })); }; });
+    U.$$('[data-consent]', el).forEach(function (b) { b.onclick = function () { guarded(b, request({ action: b.getAttribute('data-action'), consentId: b.getAttribute('data-consent') })); }; });
+  }
+  function reportHTML(r) { return '<article class="card"><span class="badge green">교사 확인 리포트</span><h3 class="mt12">아이의 말</h3><p class="pre mt8">“' + esc(r.quote) + '”</p><h3 class="mt16">선생님의 관찰</h3><p class="pre mt8">' + esc(r.teacherNote || '관찰한 항목을 함께 확인해 주세요.') + '</p><div class="observation-grid mt12">' + areas.map(function (k) { return '<div><b>' + esc(k) + '</b><span>' + esc((r.observations || {})[k] || '미확인') + '</span></div>'; }).join('') + '</div><div class="note mt16"><b>다음 연습 · 집에서 해 볼 질문</b><p class="pre mt8">' + esc(r.nextPractice) + '</p></div></article>'; }
+  function teacher(el) {
+    var st = S.state, me = D.me();
+    el.innerHTML = '<div class="row between"><div><h2>수업 운영 · 관찰과 피드백</h2><p class="muted mt8">AI는 초안을 돕고, 보호자에게 보여 줄 내용은 선생님이 확인합니다.</p></div><div class="row">' + (me.role === 'admin' ? '<button class="btn ghost" id="schoolNewClass">반 만들기</button><button class="btn ghost" id="schoolEnroll">계정 등록·연결</button>' : '') + '<button class="btn" id="schoolNewMission">미션 검토·등록</button></div></div><div class="grid g3 mt16">' + h.stat('운영 중인 반', st.classes.length, '초대된 학생·보호자와 함께') + h.stat('마친 미션', st.attempts.filter(function (t) { return t.submittedAt; }).length, '내 생각 → 비교 → 선택') + h.stat('확인한 리포트', st.reports.filter(function (r) { return r.approvedAt; }).length, '점수·순위 없이 장면으로') + '</div><div class="card mt16"><h3>반과 참여자</h3>' + st.classes.map(function (c) { return '<p class="small mt8"><b>' + esc(c.name) + '</b> · ' + esc(c.level) + ' · 학생 ' + (c.studentIds || []).length + '명 · 보호자 ' + (c.guardianIds || []).length + '명</p>'; }).join('') + '</div><div class="stack mt16">' + st.consents.filter(function (c) { return c.status !== 'verified'; }).map(function (c) { return '<div class="card"><b>' + esc(name(c.studentId)) + (c.deletionRequestedAt ? ' · 삭제 요청 접수 · ' : ' · 보호자 동의 ') + esc(c.status === 'accepted' ? '확인 대기' : c.status === 'withdrawn' ? '철회' : '요청 중') + '</b>' + (c.status === 'accepted' ? '<button class="btn soft sm" data-verify="' + esc(c.id) + '">확인 방법 남기기</button>' : '') + (c.deletionRequestedAt && me.role === 'admin' ? '<button class="btn danger sm" data-delete-student="' + esc(c.id) + '">요청 확인 후 학생 기록 삭제</button>' : '') + '</div>'; }).join('') + '</div><h2 class="mt24">학생의 판단 장면</h2><div class="stack mt16">' + (st.attempts.length ? st.attempts.map(function (t) { var m = st.missions.find(function (m) { return m.id === t.missionId; }); return '<article class="card"><div class="row between"><div><span class="badge ' + (t.submittedAt ? 'green' : 'gold') + '">' + (t.submittedAt ? '미션 완료' : '진행 중') + '</span><h3 class="mt12">' + esc(name(t.userId)) + ' · ' + esc(m ? m.title : '') + '</h3></div>' + (t.submittedAt ? '<button class="btn soft" data-observe="' + esc(t.id) + '">관찰 · 리포트</button>' : '') + '</div><p class="pre mt12"><b>내 생각 먼저</b> · ' + esc(t.thoughts || '') + '</p><p class="pre mt8"><b>아이의 선택과 이유</b> · ' + esc(t.reason || '아직 생각 중이에요.') + '</p></article>'; }).join('') : '<div class="card"><p class="muted">학생이 미션을 풀면 실제 답변이 이곳에 모입니다.</p></div>') + '</div>';
+    var nc = U.$('#schoolNewClass', el); if (nc) nc.onclick = function () { formModal('반 만들기', '<label>반 이름<input name="name" required></label><label>과정<select name="level"><option>초5–6</option><option>초1–4</option><option>중학생</option><option>고등학생</option></select></label>', 'createClass'); };
+    var en = U.$('#schoolEnroll', el); if (en) en.onclick = function () { formModal('계정 등록·보호자 연결', classSelect() + '<label>역할<select name="role"><option value="teacher">교사</option><option value="guardian">보호자</option><option value="student">학생</option></select></label><label>이름 또는 학생 별칭<input name="name" required></label><label>로그인용 이메일<input name="email" type="email" required></label><label>임시 비밀번호<input name="password" type="password" minlength="12" required autocomplete="new-password"></label><p class="tiny muted">영문·숫자 12자 이상. 학생 계정은 보호자를 먼저 등록한 후 연결합니다.</p><label>학생 과정<select name="ageBand"><option>초5–6</option><option>초1–4</option><option>중학생</option><option>고등학생</option></select></label><label>연결할 보호자<select name="guardianId"><option value="">성인 계정은 선택하지 않음</option>' + st.users.filter(function (u) { return u.role === 'guardian'; }).map(function (u) { return '<option value="' + esc(u.id) + '">' + esc(u.name) + '</option>'; }).join('') + '</select></label>', 'enroll'); };
+    U.$('#schoolNewMission', el).onclick = function () { formModal('교사가 검토한 미션 등록', classSelect() + '<label>미션 제목<input name="title" required></label><label>과정<select name="level"><option>초5–6</option><option>초1–4</option><option>중학생</option><option>고등학생</option></select></label>' + [['conditions', '지켜야 할 조건'], ['resources', '비교할 자료와 출처'], ['aiExample', '검토한 AI 예시'], ['question', '생각 점검 질문']].map(function (f) { return '<label>' + f[1] + '<textarea name="' + f[0] + '" rows="3" required></textarea></label>'; }).join(''), 'saveMission'); };
+    U.$$('[data-verify]', el).forEach(function (b) { b.onclick = function () { var md = A.modal({ title: '보호자 동의 확인', body: '<form class="stack"><p class="small muted">실제 보호자 여부와 동의 절차를 확인한 방법을 남깁니다. 개인정보나 증명서 원본은 여기에 붙여넣지 마세요.</p><label>확인 방법<textarea name="verificationNote" required rows="3"></textarea></label><button class="btn">확인하고 미션 열기</button></form>' }); U.$('form', md.body).onsubmit = function (e) { e.preventDefault(); guarded(U.$('button', e.target), request({ action: 'verifyConsent', consentId: b.getAttribute('data-verify'), verificationNote: new FormData(e.target).get('verificationNote') }), function () { md.close(); A.render(); }); }; }; });
+    U.$$('[data-delete-student]', el).forEach(function (b) { b.onclick = function () { A.confirm('보호자의 삭제 요청을 확인했나요? 학생 계정·미션·리포트를 삭제합니다.', '삭제').then(function (yes) { if (yes) guarded(b, request({ action: 'deleteStudent', consentId: b.getAttribute('data-delete-student') })); }); }; });
+    U.$$('[data-observe]', el).forEach(function (b) { b.onclick = function () { observe(b.getAttribute('data-observe')); }; });
+  }
+  function classSelect() { return '<label>반<select name="classId" required>' + S.state.classes.map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join('') + '</select></label>'; }
+  function formModal(title, body, action) { var md = A.modal({ title: title, body: '<form class="stack">' + body + '<button class="btn" type="submit">저장</button></form>' }); U.$('form', md.body).onsubmit = function (e) { e.preventDefault(); var b = Object.fromEntries(new FormData(e.target)); b.action = action; guarded(U.$('button', e.target), request(b), function () { md.close(); A.render(); }); }; }
+  function observe(id) {
+    var t = S.state.attempts.find(function (t) { return t.id === id; }), r = S.state.reports.find(function (r) { return r.attemptId === id; });
+    var md = A.modal({ title: name(t.userId) + ' · 관찰과 리포트', wide: true, body: '<p class="note">아이의 말: “' + esc(t.reason) + '”</p><form id="observationForm" class="stack mt16">' + areas.map(function (k) { return '<label>' + esc(k) + '<select data-area="' + esc(k) + '">' + levels.map(function (lv) { return '<option' + ((t.observations || {})[k] === lv ? ' selected' : '') + '>' + esc(lv) + '</option>'; }).join('') + '</select></label>'; }).join('') + '<label>관찰한 실제 장면<textarea name="teacherNote" rows="3" required>' + esc(t.teacherNote || '') + '</textarea></label><button class="btn" type="submit">관찰 저장 후 리포트 초안 만들기</button></form><div id="reportReview" class="mt16">' + (r ? '<h3>리포트 초안 · ' + esc(r.status) + '</h3><label class="lb mt12">보호자에게 보여 줄 관찰<textarea id="reportTeacherNote" rows="3">' + esc(r.teacherNote || '') + '</textarea></label><label class="lb mt12">다음 연습 · 집에서 해 볼 질문<textarea id="reportNext" rows="4">' + esc(r.nextPractice) + '</textarea></label><button class="btn mt16" id="approveSchoolReport">내가 확인한 내용으로 보호자에게 공개</button>' : '') + '</div>' });
+    U.$('#observationForm', md.body).onsubmit = function (e) { e.preventDefault(); var observations = {}; U.$$('[data-area]', e.target).forEach(function (s) { observations[s.getAttribute('data-area')] = s.value; }); guarded(U.$('button', e.target), request({ action: 'observe', attemptId: id, observations: observations, teacherNote: new FormData(e.target).get('teacherNote') }).then(function () { return request({ action: 'draftReport', attemptId: id }); }), function () { md.close(); observe(id); }); };
+    var ap = U.$('#approveSchoolReport', md.body); if (ap) ap.onclick = function () { guarded(ap, request({ action: 'approveReport', attemptId: id, teacherNote: U.$('#reportTeacherNote', md.body).value, nextPractice: U.$('#reportNext', md.body).value }), function () { md.close(); A.render(); A.toast('교사 확인을 마쳤어요. 연결된 보호자만 볼 수 있어요.'); }); };
+  }
+  ['learner', 'mentor', 'admin', 'student', 'teacher', 'guardian'].forEach(function (role) { A.route(role, '#/school', intro); });
+  A.route('student', '#/school/attempt/:id', attempt);
+})();
